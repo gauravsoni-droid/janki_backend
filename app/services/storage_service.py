@@ -3,8 +3,10 @@ Google Cloud Storage service for document operations.
 """
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
+import os
 from dataclasses import dataclass
 from typing import List
 from uuid import uuid4
@@ -42,10 +44,23 @@ class StorageService:
 
         # Prefer explicit service-account key file if configured, otherwise fall back to ADC.
         # This makes local dev on Windows much less flaky.
+        # Supports both JSON string (for cloud platforms) and file path (for local dev)
         if getattr(settings, "google_application_credentials", ""):
-            cred_path = settings.google_application_credentials.strip()
-            if cred_path:
-                self._client = storage.Client.from_service_account_json(cred_path)
+            cred_value = settings.google_application_credentials.strip()
+            if cred_value:
+                # Check if it's a JSON string (starts with {) - for cloud platforms
+                if cred_value.startswith("{"):
+                    try:
+                        cred_dict = json.loads(cred_value)
+                        self._client = storage.Client.from_service_account_info(cred_dict)
+                    except json.JSONDecodeError:
+                        self._client = storage.Client()
+                # Otherwise, treat as file path
+                elif os.path.exists(cred_value):
+                    self._client = storage.Client.from_service_account_json(cred_value)
+                else:
+                    # File not found, fall back to ADC
+                    self._client = storage.Client()
             else:
                 self._client = storage.Client()
         else:

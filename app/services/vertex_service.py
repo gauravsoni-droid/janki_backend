@@ -2,6 +2,7 @@
 Google Agent Builder service - Dialogflow CX integration.
 """
 import os
+import json
 from typing import Optional
 from google.oauth2 import service_account
 from app.config import settings
@@ -23,15 +24,27 @@ class GoogleAgentService:
             # Store credentials for later use
             self.credentials = None
             if settings.google_application_credentials:
-                cred_path = settings.google_application_credentials.strip()
-                if os.path.exists(cred_path):
-                    logger.info(f"Using service account credentials from: {cred_path}")
+                cred_value = settings.google_application_credentials.strip()
+                # Check if it's a JSON string (starts with {) - for cloud platforms
+                if cred_value.startswith("{"):
+                    try:
+                        cred_dict = json.loads(cred_value)
+                        logger.info("Using service account credentials from JSON environment variable")
+                        self.credentials = service_account.Credentials.from_service_account_info(
+                            cred_dict,
+                            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                        )
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse credentials JSON: {str(e)}")
+                # Otherwise, treat as file path
+                elif os.path.exists(cred_value):
+                    logger.info(f"Using service account credentials from: {cred_value}")
                     self.credentials = service_account.Credentials.from_service_account_file(
-                        cred_path,
+                        cred_value,
                         scopes=["https://www.googleapis.com/auth/cloud-platform"]
                     )
                 else:
-                    logger.warning(f"Credentials file not found at: {cred_path}")
+                    logger.warning(f"Credentials file not found at: {cred_value}")
             
             if not self.credentials:
                 logger.info("Will use Application Default Credentials")
@@ -118,14 +131,28 @@ class GoogleAgentService:
             if self.credentials:
                 credentials = self.credentials
             elif settings.google_application_credentials:
-                cred_path = settings.google_application_credentials.strip()
-                if os.path.exists(cred_path):
+                cred_value = settings.google_application_credentials.strip()
+                # Check if it's a JSON string (starts with {) - for cloud platforms
+                if cred_value.startswith("{"):
+                    try:
+                        cred_dict = json.loads(cred_value)
+                        credentials = service_account.Credentials.from_service_account_info(
+                            cred_dict,
+                            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                        )
+                    except json.JSONDecodeError as e:
+                        raise Exception(f"Failed to parse credentials JSON: {str(e)}")
+                # Otherwise, treat as file path
+                elif os.path.exists(cred_value):
                     credentials = service_account.Credentials.from_service_account_file(
-                        cred_path,
+                        cred_value,
                         scopes=["https://www.googleapis.com/auth/cloud-platform"]
                     )
                 else:
-                    raise Exception(f"Credentials file not found: {cred_path}")
+                    # Fall back to Application Default Credentials instead of raising error
+                    logger.warning(f"Credentials file not found at: {cred_value}, falling back to ADC")
+                    from google.auth import default
+                    credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
             else:
                 from google.auth import default
                 credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
