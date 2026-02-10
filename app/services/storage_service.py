@@ -79,7 +79,8 @@ class StorageService:
         file_type = content_type or "application/octet-stream"
 
         # Determine scope based on prefixed path
-        is_company = path.startswith("documents/company/")
+        # Treat both "documents/company/" and "company/" as company documents
+        is_company = path.startswith("documents/company/") or path.startswith("company/")
 
         # Derive user_id from path for user docs, otherwise use provided hint or empty
         # Structure: users/{user_id}/{document_id}/{filename}
@@ -102,6 +103,34 @@ class StorageService:
             is_company_doc=is_company,
             uploaded_at=uploaded_at,
         )
+
+    def list_all_documents(self) -> List[StoredDocument]:
+        """
+        List ALL documents from the bucket, regardless of prefix or path.
+        
+        This method retrieves every blob in the bucket that is not a directory placeholder.
+        """
+        documents: List[StoredDocument] = []
+        
+        try:
+            # List all blobs in the bucket without any prefix filter
+            for blob in self._bucket.list_blobs():
+                if not blob.name.endswith("/"):  # Skip "directory" placeholders
+                    # Determine user_id hint from path if possible
+                    user_id_hint = None
+                    if blob.name.startswith("users/"):
+                        parts = blob.name.split("/")
+                        if len(parts) > 1:
+                            user_id_hint = parts[1]
+                    elif blob.name.startswith("documents/company/"):
+                        user_id_hint = "company"
+                    
+                    documents.append(self._blob_to_document(blob, user_id_hint=user_id_hint))
+            
+            return documents
+        except Exception as exc:
+            logger.exception("Error listing all documents from GCS: %s", exc)
+            raise
 
     def list_documents_by_scope(
         self, user_id: str, scope: str, is_admin: bool
@@ -130,10 +159,15 @@ class StorageService:
                         documents.append(self._blob_to_document(blob, user_id_hint=user_id))
 
             if scope in ("COMPANY", "ALL"):
-                company_prefix = "documents/company/"
-                for blob in self._bucket.list_blobs(prefix=company_prefix):
-                    if not blob.name.endswith("/"):
-                        documents.append(self._blob_to_document(blob, user_id_hint="company"))
+                # Primary company docs location used by the app
+                company_prefixes = [
+                    "documents/company/",  # app-created company docs
+                    "company/",            # legacy/other company docs placed directly under 'company/'
+                ]
+                for prefix in company_prefixes:
+                    for blob in self._bucket.list_blobs(prefix=prefix):
+                        if not blob.name.endswith("/"):
+                            documents.append(self._blob_to_document(blob, user_id_hint="company"))
 
             # Non-admin users should still be able to see company docs; admin flag is reserved
             # for upload operations (marking company docs).
@@ -240,13 +274,21 @@ class StorageService:
         try:
             # Extract path from bucket_path (format: gs://bucket-name/path)
             if bucket_path.startswith("gs://"):
-                gcs_path = bucket_path.replace(f"gs://{self._bucket.name}/", "")
+                # Use split to be more robust than replace
+                if f"gs://{self._bucket.name}/" in bucket_path:
+                    gcs_path = bucket_path.split(f"gs://{self._bucket.name}/", 1)[1]
+                else:
+                    # Try to extract path after gs://bucket-name/
+                    parts = bucket_path.split("/", 3)
+                    gcs_path = parts[3] if len(parts) > 3 else bucket_path
             else:
                 # Assume it's already just the path
                 gcs_path = bucket_path
             
             blob = self._bucket.blob(gcs_path)
-            return blob.exists()
+            exists = blob.exists()
+            logger.debug(f"Checked document existence: bucket_path={bucket_path}, gcs_path={gcs_path}, exists={exists}")
+            return exists
         except Exception as exc:
             logger.error(f"Error checking document existence for {bucket_path}: {exc}")
             # If we can't check, assume it exists to avoid false negatives

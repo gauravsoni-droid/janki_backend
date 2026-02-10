@@ -71,20 +71,268 @@ async def list_documents(
     db: Session = Depends(get_db),
 ):
     """
-    List documents from database based on knowledge scope.
+    List documents from database and/or bucket based on knowledge scope.
     
     Documents are retrieved from SQLite database using user_id from Google OAuth token.
     The same user_id is used consistently across sessions.
+    
+    When scope=ALL, also retrieves all documents directly from the bucket to ensure
+    complete visibility of all available documents.
 
     - scope=MY: only documents uploaded by the current user
     - scope=COMPANY: only company-wide documents (is_company_doc=True)
-    - scope=ALL: both personal and company documents
+    - scope=ALL: both personal and company documents, plus all documents from bucket
     """
     user_id = token.get("userId") or token.get("email")
     is_admin = bool(token.get("isAdmin"))
     scope_upper = (scope or "ALL").upper()
 
     try:
+        # When scope is ALL, retrieve documents from both database and bucket
+        if scope_upper == "ALL" and storage_service:
+            # Get ALL documents from bucket (not just specific prefixes)
+            bucket_docs = storage_service.list_all_documents()
+            logger.info(f"Retrieved {len(bucket_docs)} documents from bucket for scope ALL")
+
+            # Helper function to normalize bucket_path for comparison
+            def normalize_path(path: str) -> str:
+                """Normalize bucket_path by removing gs://bucket-name/ prefix if present."""
+                if not path:
+                    return ""
+                # Remove gs://bucket-name/ prefix if present
+                if path.startswith("gs://"):
+                    # Split: gs://bucket-name/path/to/file
+                    # We want: path/to/file
+                    parts = path.split("/", 3)
+                    if len(parts) >= 4:
+                        return parts[3]  # Return path after bucket name
+                    # If split didn't work as expected, try removing gs:// and bucket name
+                    if "/" in path[5:]:  # After "gs://"
+                        return path.split("/", 3)[-1] if len(path.split("/")) > 3 else path
+                    return path
+                # If it's already just a path, return as-is
+                return path
+
+            # Shared merge helper so we can reuse for ALL and COMPANY scopes
+            def merge_bucket_and_db(
+                bucket_documents,
+                db_documents,
+            ):
+                # Create a map of normalized path -> StoredDocument for quick lookup
+                bucket_docs_map = {}
+                for bucket_doc in bucket_documents:
+                    normalized_path = normalize_path(bucket_doc.bucket_path)
+                    bucket_docs_map[normalized_path] = bucket_doc
+
+                merged_documents = []
+                seen_paths = set()
+
+                # First, add all database documents (they have richer metadata)
+                for db_doc in db_documents:
+                    normalized_path = normalize_path(db_doc.bucket_path)
+                    if normalized_path not in seen_paths:
+                        # Verify document exists in bucket
+                        if storage_service.document_exists(db_doc.bucket_path):
+                            merged_documents.append(db_doc)
+                            seen_paths.add(normalized_path)
+
+                # Then, add bucket documents that aren't in database
+                for normalized_path, bucket_doc in bucket_docs_map.items():
+                    if normalized_path not in seen_paths:
+                        # Create a Document-like object from bucket document
+                        merged_documents.append(
+                            {
+                                "id": bucket_doc.id,  # This is the path from StoredDocument
+                                "filename": bucket_doc.filename,
+                                "file_type": bucket_doc.file_type,
+                                "file_size": bucket_doc.file_size,
+                                "bucket_path": bucket_doc.bucket_path,
+                                "user_id": bucket_doc.user_id,
+                                "is_company_doc": bucket_doc.is_company_doc,
+                                "uploaded_at": bucket_doc.uploaded_at,
+                                "category": None,  # Bucket documents don't have category
+                            }
+                        )
+                        seen_paths.add(normalized_path)
+
+                return merged_documents
+
+            # Load DB docs for ALL scope (user + company)
+            db_query = db.query(Document).filter(
+                (Document.user_id == user_id) | (Document.is_company_doc == True)
+            )
+            db_docs = db_query.all()
+
+            merged_documents = merge_bucket_and_db(bucket_docs, db_docs)
+
+            logger.info(
+                f"Total merged documents for ALL: {len(merged_documents)} (DB: {len(db_docs)}, Bucket: {len(bucket_docs)})"
+            )
+
+            # Sort by uploaded_at (newest first)
+            def get_sort_key(doc):
+                if isinstance(doc, Document):
+                    return doc.uploaded_at.isoformat() if doc.uploaded_at else ""
+                else:
+                    return doc["uploaded_at"] if isinstance(doc["uploaded_at"], str) else ""
+
+            merged_documents.sort(key=get_sort_key, reverse=True)
+
+            # Apply pagination
+            total_count = len(merged_documents)
+            paginated_docs = merged_documents[offset : offset + limit]
+
+            # Convert to response model
+            documents = []
+            for doc in paginated_docs:
+                if isinstance(doc, Document):
+                    # Database document
+                    documents.append(
+                        DocumentModel(
+                            id=doc.id,
+                            filename=doc.filename,
+                            file_type=doc.file_type,
+                            file_size=doc.file_size,
+                            bucket_path=doc.bucket_path,
+                            user_id=doc.user_id,
+                            is_company_doc=doc.is_company_doc,
+                            uploaded_at=doc.uploaded_at.isoformat() if doc.uploaded_at else "",
+                            category=getattr(doc, "category", None),
+                        )
+                    )
+                else:
+                    # Bucket document (dict)
+                    documents.append(
+                        DocumentModel(
+                            id=doc["id"],
+                            filename=doc["filename"],
+                            file_type=doc["file_type"],
+                            file_size=doc["file_size"],
+                            bucket_path=doc["bucket_path"],
+                            user_id=doc["user_id"],
+                            is_company_doc=doc["is_company_doc"],
+                            uploaded_at=doc["uploaded_at"],
+                            category=doc.get("category"),
+                        )
+                    )
+
+            return DocumentListResponse(
+                documents=documents,
+                total=total_count,
+            )
+
+        # When scope is COMPANY, retrieve only company docs from company folder
+        if scope_upper == "COMPANY" and storage_service:
+            # List only company documents from bucket (documents/company/)
+            bucket_docs = storage_service.list_documents_by_scope(user_id, "COMPANY", is_admin)
+            logger.info(
+                f"Retrieved {len(bucket_docs)} company documents from bucket for scope COMPANY"
+            )
+
+            # Helper function to normalize bucket_path for comparison (reuse from ALL)
+            def normalize_path_company(path: str) -> str:
+                if not path:
+                    return ""
+                if path.startswith("gs://"):
+                    parts = path.split("/", 3)
+                    if len(parts) >= 4:
+                        return parts[3]
+                    if "/" in path[5:]:
+                        return path.split("/", 3)[-1] if len(path.split("/")) > 3 else path
+                    return path
+                return path
+
+            # Map bucket docs by normalized path
+            bucket_docs_map = {}
+            for bucket_doc in bucket_docs:
+                normalized_path = normalize_path_company(bucket_doc.bucket_path)
+                bucket_docs_map[normalized_path] = bucket_doc
+
+            # Load only company documents from DB
+            db_docs = db.query(Document).filter(Document.is_company_doc == True).all()
+
+            merged_documents = []
+            seen_paths = set()
+
+            # Add DB company docs first
+            for db_doc in db_docs:
+                normalized_path = normalize_path_company(db_doc.bucket_path)
+                if normalized_path not in seen_paths:
+                    if storage_service.document_exists(db_doc.bucket_path):
+                        merged_documents.append(db_doc)
+                        seen_paths.add(normalized_path)
+
+            # Add bucket-only company docs
+            for normalized_path, bucket_doc in bucket_docs_map.items():
+                if normalized_path not in seen_paths:
+                    merged_documents.append(
+                        {
+                            "id": bucket_doc.id,
+                            "filename": bucket_doc.filename,
+                            "file_type": bucket_doc.file_type,
+                            "file_size": bucket_doc.file_size,
+                            "bucket_path": bucket_doc.bucket_path,
+                            "user_id": bucket_doc.user_id,
+                            "is_company_doc": bucket_doc.is_company_doc,
+                            "uploaded_at": bucket_doc.uploaded_at,
+                            "category": None,
+                        }
+                    )
+                    seen_paths.add(normalized_path)
+
+            logger.info(
+                f"Total merged company documents: {len(merged_documents)} (DB: {len(db_docs)}, Bucket: {len(bucket_docs)})"
+            )
+
+            # Sort and paginate (same as ALL)
+            def get_sort_key_company(doc):
+                if isinstance(doc, Document):
+                    return doc.uploaded_at.isoformat() if doc.uploaded_at else ""
+                else:
+                    return doc["uploaded_at"] if isinstance(doc["uploaded_at"], str) else ""
+
+            merged_documents.sort(key=get_sort_key_company, reverse=True)
+
+            total_count = len(merged_documents)
+            paginated_docs = merged_documents[offset : offset + limit]
+
+            documents = []
+            for doc in paginated_docs:
+                if isinstance(doc, Document):
+                    documents.append(
+                        DocumentModel(
+                            id=doc.id,
+                            filename=doc.filename,
+                            file_type=doc.file_type,
+                            file_size=doc.file_size,
+                            bucket_path=doc.bucket_path,
+                            user_id=doc.user_id,
+                            is_company_doc=doc.is_company_doc,
+                            uploaded_at=doc.uploaded_at.isoformat() if doc.uploaded_at else "",
+                            category=getattr(doc, "category", None),
+                        )
+                    )
+                else:
+                    documents.append(
+                        DocumentModel(
+                            id=doc["id"],
+                            filename=doc["filename"],
+                            file_type=doc["file_type"],
+                            file_size=doc["file_size"],
+                            bucket_path=doc["bucket_path"],
+                            user_id=doc["user_id"],
+                            is_company_doc=doc["is_company_doc"],
+                            uploaded_at=doc["uploaded_at"],
+                            category=doc.get("category"),
+                        )
+                    )
+
+            return DocumentListResponse(
+                documents=documents,
+                total=total_count,
+            )
+
+        # For MY and COMPANY scopes (when storage_service is unavailable), use database-only approach
         # Build query based on scope
         query = db.query(Document)
         
@@ -94,7 +342,7 @@ async def list_documents(
         elif scope_upper == "COMPANY":
             # Only company documents
             query = query.filter(Document.is_company_doc == True)
-        else:  # ALL
+        else:  # ALL (fallback if storage_service is None)
             # User's documents OR company documents
             query = query.filter(
                 (Document.user_id == user_id) | (Document.is_company_doc == True)
@@ -156,7 +404,7 @@ async def list_documents(
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Error listing documents from database: {exc}",
+            detail=f"Error listing documents: {exc}",
         )
 
 
@@ -525,7 +773,7 @@ async def check_document_status(
         )
 
 
-@router.get("/documents/{document_id}/view-url", response_model=ViewUrlResponse)
+@router.get("/documents/{document_id:path}/view-url", response_model=ViewUrlResponse)
 async def get_document_view_url(
     document_id: str,
     token: dict = Depends(verify_token),
@@ -537,6 +785,7 @@ async def get_document_view_url(
     - Validates user access (same rules as listing: user_id match or is_company_doc)
     - Generates a time-limited signed URL from GCS
     - Returns the signed URL with expiration time
+    - Handles both database documents and bucket-only documents
     """
     if storage_service is None:
         raise HTTPException(
@@ -548,23 +797,79 @@ async def get_document_view_url(
     is_admin = bool(token.get("isAdmin"))
 
     try:
-        # Get document from database
+        # Try to get document from database first
         db_document = db.query(Document).filter(Document.id == document_id).first()
+        bucket_path = None
+        is_company_doc = False
+        doc_user_id = None
         
-        if not db_document:
-            raise HTTPException(
-                status_code=404,
-                detail="Document not found.",
-            )
+        if db_document:
+            # Document exists in database
+            bucket_path = db_document.bucket_path
+            is_company_doc = db_document.is_company_doc
+            doc_user_id = db_document.user_id
+            logger.info(f"Found document in database: id={document_id}, bucket_path={bucket_path}")
+        else:
+            # Document might only exist in bucket (bucket-only document)
+            # The document_id from bucket documents can be:
+            # 1. The path (from _blob_to_document: blob.name) - e.g., "users/user123/doc456/file.pdf"
+            # 2. The full bucket_path (from DocumentModel) - e.g., "gs://bucket-name/users/user123/doc456/file.pdf"
+            # Construct the full bucket_path
+            if document_id.startswith("gs://"):
+                bucket_path = document_id
+                # Extract gcs_path from bucket_path - use split to be more robust
+                if f"gs://{settings.gcs_bucket_name}/" in bucket_path:
+                    gcs_path = bucket_path.split(f"gs://{settings.gcs_bucket_name}/", 1)[1]
+                else:
+                    # Try to extract path after gs://bucket-name/
+                    parts = bucket_path.split("/", 3)
+                    gcs_path = parts[3] if len(parts) > 3 else bucket_path
+            else:
+                # document_id is the path relative to bucket root (blob.name format)
+                gcs_path = document_id
+                bucket_path = f"gs://{settings.gcs_bucket_name}/{gcs_path}"
+            
+            logger.info(f"Looking up bucket-only document: document_id={document_id}, gcs_path={gcs_path}, bucket_path={bucket_path}")
+            
+            # Check if document exists in bucket - try both formats
+            exists = storage_service.document_exists(bucket_path)
+            if not exists:
+                # Try with just the gcs_path
+                logger.info(
+                    f"Document not found with bucket_path, trying gcs_path directly: {gcs_path}"
+                )
+                exists = storage_service.document_exists(gcs_path)
+                if exists:
+                    # Update bucket_path to use the format that works
+                    bucket_path = f"gs://{settings.gcs_bucket_name}/{gcs_path}"
+
+            if not exists:
+                logger.warning(
+                    f"Document not found in bucket: document_id={document_id}, gcs_path={gcs_path}, bucket_path={bucket_path}"
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document not found in storage: {gcs_path}",
+                )
+
+            # Determine if it's a company doc based on path
+            # Treat both "documents/company/" and "company/" as company documents
+            is_company_doc = gcs_path.startswith("documents/company/") or gcs_path.startswith("company/")
+            
+            # Extract user_id from path if it's a user document
+            if gcs_path.startswith("users/"):
+                parts = gcs_path.split("/")
+                if len(parts) > 1:
+                    doc_user_id = parts[1]
         
         # Check access permissions (same logic as list_documents)
         has_access = False
-        if db_document.is_company_doc:
+        if is_company_doc:
             # Company documents are accessible to all authenticated users
             has_access = True
         else:
             # User documents are only accessible to the owner
-            has_access = (db_document.user_id == user_id)
+            has_access = (doc_user_id == user_id) if doc_user_id else False
         
         if not has_access:
             raise HTTPException(
@@ -575,7 +880,7 @@ async def get_document_view_url(
         # Generate signed URL (expires in 1 hour)
         expiration_seconds = 3600
         signed_url = storage_service.get_signed_url(
-            db_document.bucket_path,
+            bucket_path,
             expiration_seconds=expiration_seconds
         )
         

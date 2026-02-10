@@ -264,85 +264,12 @@ async def send_chat_message(
             if not session:
                 raise HTTPException(status_code=404, detail="Chat session not found.")
 
-        # Get candidate document IDs based on scope
-        candidate_document_ids = get_scoped_document_ids(db, user_id, scope_upper)
-
-        if not candidate_document_ids:
-            # region agent log
-            try:
-                ts_ms = int(time.time() * 1000)
-                with open(
-                    r"c:\Users\Kinjal Cloudus\Desktop\janki_bmad\.cursor\debug.log",
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "id": f"log_{ts_ms}_no_docs",
-                                "timestamp": ts_ms,
-                                "runId": "pre-fix-1",
-                                "hypothesisId": "H3",
-                                "location": "backend/app/routers/chat.py:send_chat_message",
-                                "message": "No documents for scope; using empty_message",
-                                "data": {
-                                    "user_id": user_id,
-                                    "scope": scope_upper,
-                                    "session_id": session_id,
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # endregion
-            # No documents available for this scope; respond with helpful message
-            empty_message = (
-                "You haven't uploaded any documents yet for this knowledge scope. "
-                "Upload documents to get personalized answers."
-            )
-            if scope_upper == "MY":
-                empty_message = (
-                    "You haven't uploaded any documents yet. "
-                    "Upload documents to get personalized answers."
-                )
-            elif scope_upper == "COMPANY":
-                empty_message = "No company documents are available at this time."
-
-            # Persist user and assistant messages under this session
-            user_msg = ChatMessage(
-                user_id=user_id,
-                company_id=company_id,
-                session_id=session_id,
-                role="user",
-                content=request.message,
-                scope=scope_upper,
-            )
-            db.add(user_msg)
-
-            assistant_msg = ChatMessage(
-                user_id=user_id,
-                company_id=company_id,
-                session_id=session_id,
-                role="assistant",
-                content=empty_message,
-                scope=scope_upper,
-                sources=[],
-            )
-            db.add(assistant_msg)
-            db.commit()
-
-            return ChatResponse(
-                response=empty_message,
-                conversation_id=session_id,
-                message_id=f"msg_{hash(session_id + request.message)}",
-                sources=[],
-            )
-
-        # Send message to Google Agent Builder with document context.
-        # We use the chat session ID as the external conversation identifier so that
-        # each chat session maps 1:1 to an Agent Builder session.
+        # Send message to Google Agent Builder.
+        # We no longer restrict by per-user/company document IDs; the agent
+        # handles retrieval over all documents available in the bucket. The
+        # selected scope is kept only for logging and session metadata.
+        # We use the chat session ID as the external conversation identifier so
+        # that each chat session maps 1:1 to an Agent Builder session.
         result = await google_agent_service.send_message(
             message=request.message,
             conversation_id=session_id,
