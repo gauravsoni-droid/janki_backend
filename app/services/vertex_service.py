@@ -3,6 +3,10 @@ Google Agent Builder service - Dialogflow CX integration.
 """
 import os
 import json
+import re
+import uuid
+import hashlib
+from urllib.parse import quote
 from typing import Optional
 from google.oauth2 import service_account
 from app.config import settings
@@ -76,12 +80,14 @@ class GoogleAgentService:
         """Send message using Dialogflow CX API via REST."""
         import httpx
         
-        session_id = conversation_id or f"session_{user_id or 'default'}"
+        session_id = self._normalize_session_id(
+            conversation_id or f"session_{user_id or 'default'}"
+        )
         access_token = self._get_access_token()
         
         # Dialogflow CX REST API endpoint format
         # For regional endpoints: https://{location}-dialogflow.googleapis.com/v3beta1/...
-        url = f"https://{self.location}-dialogflow.googleapis.com/v3beta1/projects/{self.project_id}/locations/{self.location}/agents/{self.agent_id}/sessions/{session_id}:detectIntent"
+        url = f"https://{self.location}-dialogflow.googleapis.com/v3beta1/projects/{self.project_id}/locations/{self.location}/agents/{self.agent_id}/sessions/{quote(session_id)}:detectIntent"
         
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -101,8 +107,27 @@ class GoogleAgentService:
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+            try:
+                response.raise_for_status()
+                data = response.json()
+            except httpx.HTTPStatusError as e:
+                error_text = response.text
+                logger.error(
+                    "Dialogflow CX detectIntent error: %s %s",
+                    response.status_code,
+                    error_text
+                )
+                # Retry once with a fresh session if the server rejects the session id.
+                if response.status_code == 400:
+                    session_id = self._normalize_session_id(str(uuid.uuid4()))
+                    url = f"https://{self.location}-dialogflow.googleapis.com/v3beta1/projects/{self.project_id}/locations/{self.location}/agents/{self.agent_id}/sessions/{quote(session_id)}:detectIntent"
+                    retry_response = await client.post(url, json=payload, headers=headers)
+                    retry_response.raise_for_status()
+                    data = retry_response.json()
+                else:
+                    raise Exception(
+                        f"Dialogflow CX error {response.status_code}: {error_text}"
+                    ) from e
             
             # Extract response
             query_result = data.get("queryResult", {})
@@ -121,6 +146,18 @@ class GoogleAgentService:
                 "conversation_id": session_id,
                 "sources": []
             }
+
+    def _normalize_session_id(self, session_id: Optional[str]) -> str:
+        """Normalize session id to meet Dialogflow CX constraints."""
+        base = (session_id or "").strip()
+        # Replace disallowed chars; keep it URL-safe and readable.
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("._-")
+        if not normalized:
+            normalized = str(uuid.uuid4())
+        # Dialogflow CX session ID limit is 36 chars; hash if too long.
+        if len(normalized) > 36:
+            normalized = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+        return normalized
     
     def _get_access_token(self) -> str:
         """Get access token for REST API calls."""

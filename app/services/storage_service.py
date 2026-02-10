@@ -8,10 +8,12 @@ import logging
 import mimetypes
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import List
 from uuid import uuid4
 
 from google.cloud import storage
+from google.cloud.exceptions import NotFound
 
 from app.config import settings
 
@@ -70,16 +72,20 @@ class StorageService:
 
     def _blob_to_document(self, blob, user_id_hint: str | None = None) -> StoredDocument:
         """Convert a GCS blob to StoredDocument."""
-        path = blob.name  # e.g., users/{userId}/file.ext or company/file.ext
+        path = blob.name  # e.g., users/{userId}/... or documents/company/...
         filename = path.split("/")[-1]
         size = int(blob.size or 0)
         content_type, _ = mimetypes.guess_type(filename)
         file_type = content_type or "application/octet-stream"
 
-        is_company = path.startswith("company/")
+        # Determine scope based on prefixed path
+        is_company = path.startswith("documents/company/")
+
         # Derive user_id from path for user docs, otherwise use provided hint or empty
+        # Structure: users/{user_id}/{document_id}/{filename}
         if path.startswith("users/"):
             parts = path.split("/")
+            # users/{user_id}/{document_id}/{filename}
             doc_user_id = parts[1] if len(parts) > 2 else user_id_hint or ""
         else:
             doc_user_id = user_id_hint or ""
@@ -105,21 +111,26 @@ class StorageService:
 
         Scope rules:
         - MY: only user's documents under users/{user_id}/
-        - COMPANY: only company docs under company/
+        - COMPANY: only company docs under documents/company/
         - ALL: user's docs + company docs
+        
+        Storage structure:
+        - User docs: users/{user_id}/{document_id}/{filename}
+        - Company docs: documents/company/{document_id}/{filename}
         """
         scope = (scope or "ALL").upper()
         documents: List[StoredDocument] = []
 
         try:
             if scope in ("MY", "ALL"):
+                # Structure: users/{user_id}/{document_id}/{filename}
                 user_prefix = f"users/{user_id}/"
                 for blob in self._bucket.list_blobs(prefix=user_prefix):
                     if not blob.name.endswith("/"):  # Skip "directory" placeholders
                         documents.append(self._blob_to_document(blob, user_id_hint=user_id))
 
             if scope in ("COMPANY", "ALL"):
-                company_prefix = "company/"
+                company_prefix = "documents/company/"
                 for blob in self._bucket.list_blobs(prefix=company_prefix):
                     if not blob.name.endswith("/"):
                         documents.append(self._blob_to_document(blob, user_id_hint="company"))
@@ -141,17 +152,27 @@ class StorageService:
     ) -> StoredDocument:
         """
         Upload a document to GCS using the configured bucket.
-
-        - If is_company_doc: path = company/{uuid}_{filename}
-        - Else: path = users/{user_id}/{uuid}_{filename}
+        
+        Storage key pattern (bucket name → users → user id):
+        
+        - Company docs:
+          documents/company/{document_id}/{filename}
+        - User docs:
+          users/{user_id}/{document_id}/{filename}
+          
+        This ensures all user documents are stored under: bucket_name/users/{user_id}/
         """
         safe_name = filename.replace(" ", "_")
         object_id = uuid4().hex
 
         if is_company_doc:
-            path = f"company/{object_id}_{safe_name}"
+            path = f"documents/company/{object_id}/{safe_name}"
         else:
-            path = f"users/{user_id}/{object_id}_{safe_name}"
+            # Store user documents under a per-user, per-document folder:
+            #   gs://<bucket>/users/{user_id}/{document_id}/{filename}
+            # This ensures each upload has a unique bucket_path while keeping
+            # a predictable structure for browsing.
+            path = f"users/{user_id}/{object_id}/{safe_name}"
 
         blob = self._bucket.blob(path)
         content_type, _ = mimetypes.guess_type(safe_name)
@@ -178,7 +199,7 @@ class StorageService:
             bucket_path: Full GCS path (format: gs://bucket-name/path/to/file)
             
         Returns:
-            True if deleted successfully, False otherwise
+            True if deleted successfully, False if document doesn't exist in GCS
         """
         try:
             # Extract path from bucket_path (format: gs://bucket-name/path)
@@ -189,11 +210,86 @@ class StorageService:
                 gcs_path = bucket_path
             
             blob = self._bucket.blob(gcs_path)
+            
+            # Check if blob exists before trying to delete
+            if not blob.exists():
+                logger.warning(f"Document does not exist in GCS (may have been deleted manually): {gcs_path}")
+                return False
+            
             blob.delete()
             logger.info(f"Successfully deleted document from GCS: {gcs_path}")
             return True
+        except NotFound:
+            # Document doesn't exist in GCS - this is okay, just log and return False
+            logger.warning(f"Document not found in GCS (may have been deleted manually): {bucket_path}")
+            return False
         except Exception as exc:
             logger.error(f"Error deleting document from GCS {bucket_path}: {exc}")
+            raise
+
+    def document_exists(self, bucket_path: str) -> bool:
+        """
+        Check if a document exists in Google Cloud Storage.
+        
+        Args:
+            bucket_path: Full GCS path (format: gs://bucket-name/path/to/file) or just the path
+            
+        Returns:
+            True if document exists, False otherwise
+        """
+        try:
+            # Extract path from bucket_path (format: gs://bucket-name/path)
+            if bucket_path.startswith("gs://"):
+                gcs_path = bucket_path.replace(f"gs://{self._bucket.name}/", "")
+            else:
+                # Assume it's already just the path
+                gcs_path = bucket_path
+            
+            blob = self._bucket.blob(gcs_path)
+            return blob.exists()
+        except Exception as exc:
+            logger.error(f"Error checking document existence for {bucket_path}: {exc}")
+            # If we can't check, assume it exists to avoid false negatives
+            return True
+
+    def get_signed_url(self, bucket_path: str, expiration_seconds: int = 3600) -> str:
+        """
+        Generate a signed URL for viewing a document in Google Cloud Storage.
+        
+        Args:
+            bucket_path: Full GCS path (format: gs://bucket-name/path/to/file) or just the path
+            expiration_seconds: URL expiration time in seconds (default: 3600 = 1 hour)
+            
+        Returns:
+            Signed URL string that can be used to access the document
+        """
+        try:
+            # Extract path from bucket_path (format: gs://bucket-name/path)
+            if bucket_path.startswith("gs://"):
+                gcs_path = bucket_path.replace(f"gs://{self._bucket.name}/", "")
+            else:
+                # Assume it's already just the path
+                gcs_path = bucket_path
+            
+            blob = self._bucket.blob(gcs_path)
+            
+            # Check if blob exists
+            if not blob.exists():
+                raise ValueError(f"Document not found at path: {gcs_path}")
+            
+            # Calculate expiration datetime (current time + expiration_seconds)
+            expiration_time = datetime.utcnow() + timedelta(seconds=expiration_seconds)
+            
+            # Generate signed URL with expiration datetime
+            url = blob.generate_signed_url(
+                expiration=expiration_time,
+                method="GET"
+            )
+            
+            logger.info(f"Generated signed URL for document: {gcs_path} (expires at {expiration_time.isoformat()})")
+            return url
+        except Exception as exc:
+            logger.error(f"Error generating signed URL for {bucket_path}: {exc}")
             raise
 
 

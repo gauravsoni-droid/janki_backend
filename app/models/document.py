@@ -21,7 +21,10 @@ class Document(Base):
     
     # Document filename (original name from user)
     filename = Column(String, nullable=False, index=True)
-    
+
+    # Logical category label (e.g., Frontend, Backend, Architecture, Other)
+    category = Column(String, nullable=True, index=True)
+
     # File metadata
     file_type = Column(String, nullable=False)  # e.g., "application/pdf"
     file_size = Column(Integer, nullable=False)  # Size in bytes

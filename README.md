@@ -29,13 +29,27 @@ pip install -r requirements.txt
 
 ### 3. Set Up Google Cloud Credentials
 
+**For Local Development:**
+
 Option 1: Service Account Key File
 - Download a service account JSON key from Google Cloud Console
-- Set `GOOGLE_APPLICATION_CREDENTIALS` to the path of this file
+- Set `GOOGLE_APPLICATION_CREDENTIALS` to the path of this file (e.g., `./service-account-key.json`)
 
 Option 2: Application Default Credentials (ADC)
 - Run: `gcloud auth application-default login`
 - Leave `GOOGLE_APPLICATION_CREDENTIALS` empty
+
+**For Cloud Platforms (Render, Railway, etc.):**
+
+Option 3: JSON String (Recommended)
+- Open your service account JSON file in a text editor
+- Copy the entire JSON content
+- In Render/Railway environment variables, paste it as a **single line** (no line breaks)
+- Replace all actual newlines in the `private_key` field with `\n`
+- Example format: `{"type":"service_account","project_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",...}`
+- Set `GOOGLE_APPLICATION_CREDENTIALS` to this JSON string
+
+**Important:** The JSON must be on a single line with `\n` for line breaks in the private key.
 
 ### 4. Run the Server
 

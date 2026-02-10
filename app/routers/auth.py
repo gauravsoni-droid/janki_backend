@@ -2,6 +2,7 @@
 Authentication API endpoints.
 """
 import logging
+import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from google.auth.transport import requests
@@ -57,30 +58,52 @@ async def verify_google_token(request: VerifyRequest):
         logger.info(f"Verifying Google token with client ID: {settings.google_oauth_client_id[:20]}...")
         
         # Verify Google token using OAuth Client ID as audience
-        try:
-            idinfo = id_token.verify_oauth2_token(
-                request.google_token,
-                requests.Request(),
-                settings.google_oauth_client_id  # Use OAuth Client ID, not project ID
-            )
-            logger.info("Google token verified successfully")
-        except ValueError as e:
-            logger.error(f"Google token verification failed (ValueError): {str(e)}")
+        # Handle clock skew by retrying with a small delay if token is "used too early"
+        max_retries = 2
+        retry_delay = 1.0  # 1 second delay
+        idinfo = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                idinfo = id_token.verify_oauth2_token(
+                    request.google_token,
+                    requests.Request(),
+                    settings.google_oauth_client_id  # Use OAuth Client ID, not project ID
+                )
+                logger.info("Google token verified successfully")
+                break  # Success, exit retry loop
+            except ValueError as e:
+                error_msg = str(e)
+                # Check if it's a clock skew issue ("Token used too early")
+                if "Token used too early" in error_msg and attempt < max_retries:
+                    logger.warning(f"Clock skew detected (attempt {attempt + 1}/{max_retries + 1}): {error_msg}")
+                    logger.info(f"Waiting {retry_delay} seconds before retry...")
+                    await asyncio.sleep(retry_delay)
+                    continue  # Retry
+                else:
+                    logger.error(f"Google token verification failed (ValueError): {error_msg}")
+                    raise HTTPException(
+                        status_code=401,
+                        detail=f"Invalid Google token: {error_msg}"
+                    )
+            except GoogleAuthError as e:
+                logger.error(f"Google token verification failed (GoogleAuthError): {str(e)}")
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Google authentication error: {str(e)}"
+                )
+            except Exception as e:
+                logger.error(f"Unexpected error during Google token verification: {type(e).__name__}: {str(e)}")
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Token verification error: {str(e)}"
+                )
+        
+        if idinfo is None:
+            logger.error("Failed to verify token after all retries")
             raise HTTPException(
                 status_code=401,
-                detail=f"Invalid Google token: {str(e)}"
-            )
-        except GoogleAuthError as e:
-            logger.error(f"Google token verification failed (GoogleAuthError): {str(e)}")
-            raise HTTPException(
-                status_code=401,
-                detail=f"Google authentication error: {str(e)}"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error during Google token verification: {type(e).__name__}: {str(e)}")
-            raise HTTPException(
-                status_code=401,
-                detail=f"Token verification error: {str(e)}"
+                detail="Failed to verify Google token after retries"
             )
         
         # Extract user info

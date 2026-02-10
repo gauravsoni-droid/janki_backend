@@ -36,58 +36,13 @@ app.add_middleware(
 # Exception handler for 422 validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Log 422 validation errors with full request details."""
-    # #region agent log
-    try:
-        # Get request body if available
-        body = None
-        try:
-            if hasattr(request, "_body"):
-                body = request._body
-            elif hasattr(request, "body"):
-                body = await request.body()
-        except Exception:
-            pass
-        
-        # Get headers
-        headers = dict(request.headers)
-        
-        # Get form data if multipart
-        form_data = {}
-        try:
-            if request.headers.get("content-type", "").startswith("multipart/form-data"):
-                form_data = {"content_type": "multipart/form-data", "note": "form data in body"}
-        except Exception:
-            pass
-        
-        debug_payload = {
-            "sessionId": "debug-session",
-            "runId": "pre-fix",
-            "hypothesisId": "H1-H5",
-            "location": "main.py:validation_exception_handler",
-            "message": "422 Validation Error caught",
-            "data": {
-                "path": str(request.url.path),
-                "method": request.method,
-                "headers": {k: v for k, v in headers.items() if k.lower() not in ["authorization", "cookie"]},
-                "content_type": headers.get("content-type", "missing"),
-                "body_size": len(body) if body else 0,
-                "body_preview": str(body)[:200] if body else None,
-                "form_data_note": form_data,
-                "validation_errors": exc.errors() if hasattr(exc, "errors") else str(exc),
-                "error_count": len(exc.errors()) if hasattr(exc, "errors") else 0,
-            },
-            "timestamp": int(datetime.utcnow().timestamp() * 1000),
-        }
-        with open(r"c:\Users\Kinjal Cloudus\Desktop\janki_bmad\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps(debug_payload) + "\n")
-    except Exception:
-        pass
-    # #endregion
-    
+    """Return 422 validation errors in a consistent JSON format."""
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors(), "body": str(exc.body) if hasattr(exc, "body") else None},
+        content={
+            "detail": exc.errors(),
+            "body": str(exc.body) if hasattr(exc, "body") else None,
+        },
     )
 
 # Include routers
