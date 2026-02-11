@@ -186,27 +186,29 @@ class StorageService:
     ) -> StoredDocument:
         """
         Upload a document to GCS using the configured bucket.
-        
-        Storage key pattern (bucket name → users → user id):
-        
+
+        Storage key pattern (bucket name → logical folders):
+
         - Company docs:
-          documents/company/{document_id}/{filename}
+          documents/company/{filename}
         - User docs:
-          users/{user_id}/{document_id}/{filename}
-          
-        This ensures all user documents are stored under: bucket_name/users/{user_id}/
+          users/{user_id}/{filename}
+
+        This is intentionally "flat" under each user so that the path never
+        includes a separate document_id segment – the folder structure in GCS
+        is always strictly:
+
+            different-documentation/users/{user_id}/{document_name}
         """
         safe_name = filename.replace(" ", "_")
-        object_id = uuid4().hex
 
         if is_company_doc:
-            path = f"documents/company/{object_id}/{safe_name}"
+            path = f"documents/company/{safe_name}"
         else:
-            # Store user documents under a per-user, per-document folder:
-            #   gs://<bucket>/users/{user_id}/{document_id}/{filename}
-            # This ensures each upload has a unique bucket_path while keeping
-            # a predictable structure for browsing.
-            path = f"users/{user_id}/{object_id}/{safe_name}"
+            # Store user documents in a flat per-user folder:
+            #   gs://<bucket>/users/{user_id}/{filename}
+            # No document_id segment is ever added to the path.
+            path = f"users/{user_id}/{safe_name}"
 
         blob = self._bucket.blob(path)
         content_type, _ = mimetypes.guess_type(safe_name)

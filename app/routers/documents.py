@@ -473,7 +473,7 @@ async def upload_document(
     
     try:
         contents = await file.read()
-        
+
         # Validate file size (max 10 MB)
         max_size_bytes = settings.max_file_size_mb * 1024 * 1024  # Convert MB to bytes
         if len(contents) > max_size_bytes:
@@ -485,7 +485,6 @@ async def upload_document(
         if not contents:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        # Upload to Google Cloud Storage
         stored = storage_service.upload_document(
             file_bytes=contents,
             filename=file.filename,
@@ -493,19 +492,41 @@ async def upload_document(
             is_company_doc=is_company_doc_bool,
         )
 
-        # Save document metadata to database
-        # Use original filename (not UUID-prefixed) for display
-        db_document = Document(
-            filename=file.filename,  # Original filename without UUID prefix
-            file_type=stored.file_type,
-            file_size=stored.file_size,
-            bucket_path=stored.bucket_path,
-            user_id=user_id,  # Google OAuth user ID - consistent across sessions
-            is_company_doc=is_company_doc_bool,
-            category=normalized_category,
+        # Save or update document metadata in database.
+        # We enforce UNIQUE(bucket_path), so if a document with the same
+        # bucket_path already exists we update that record instead of inserting
+        # a new one. This allows users to re‑upload/replace a document without
+        # violating the unique constraint while keeping the canonical flat
+        # storage path users/{user_id}/{filename}.
+        existing = (
+            db.query(Document)
+            .filter(Document.bucket_path == stored.bucket_path)
+            .first()
         )
+
+        if existing:
+            # Update existing metadata row
+            existing.filename = file.filename
+            existing.file_type = stored.file_type
+            existing.file_size = stored.file_size
+            existing.user_id = user_id
+            existing.is_company_doc = is_company_doc_bool
+            existing.category = normalized_category
+
+            db_document = existing
+        else:
+            # Create new metadata row
+            db_document = Document(
+                filename=file.filename,  # Original filename from user
+                file_type=stored.file_type,
+                file_size=stored.file_size,
+                bucket_path=stored.bucket_path,
+                user_id=user_id,  # Google OAuth user ID - consistent across sessions
+                is_company_doc=is_company_doc_bool,
+                category=normalized_category,
+            )
+            db.add(db_document)
         
-        db.add(db_document)
         db.commit()
         db.refresh(db_document)
 
@@ -782,7 +803,7 @@ async def get_document_view_url(
     """
     Get a signed URL for viewing a document from Google Cloud Storage.
     
-    - Validates user access (same rules as listing: user_id match or is_company_doc)
+    - Allows all authenticated users to access any document
     - Generates a time-limited signed URL from GCS
     - Returns the signed URL with expiration time
     - Handles both database documents and bucket-only documents
@@ -862,20 +883,9 @@ async def get_document_view_url(
                 if len(parts) > 1:
                     doc_user_id = parts[1]
         
-        # Check access permissions (same logic as list_documents)
-        has_access = False
-        if is_company_doc:
-            # Company documents are accessible to all authenticated users
-            has_access = True
-        else:
-            # User documents are only accessible to the owner
-            has_access = (doc_user_id == user_id) if doc_user_id else False
-        
-        if not has_access:
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have access to this document.",
-            )
+        # Allow all authenticated users to access any document
+        # All documents in the bucket are accessible to any authenticated user
+        has_access = True
         
         # Generate signed URL (expires in 1 hour)
         expiration_seconds = 3600
